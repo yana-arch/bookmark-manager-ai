@@ -628,6 +628,7 @@ const App: React.FC = () => {
           onSave={handleSaveAiConfig}
           onDelete={handleDeleteAiConfig}
           onSetActive={handleSetActiveAiConfig}
+          onEdit={setEditingAiConfig}
           editingConfig={editingAiConfig}
           existingConfigs={aiConfigs}
           activeConfigId={activeAiConfigId}

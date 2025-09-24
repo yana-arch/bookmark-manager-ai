@@ -126,6 +126,7 @@ export class BookmarkOrganizer {
       detectDuplicates?: boolean;
       generateTags?: boolean;
       confidenceThreshold?: number;
+      processingMode?: 'individual' | 'batch';
     } = {}
   ): Promise<OrganizationPlan> {
     const {
@@ -133,7 +134,8 @@ export class BookmarkOrganizer {
       createHierarchy = true,
       detectDuplicates = true,
       generateTags = true,
-      confidenceThreshold = 0.7
+      confidenceThreshold = 0.7,
+      processingMode = 'individual'
     } = options;
 
     // Extract all bookmarks from the tree
@@ -143,13 +145,24 @@ export class BookmarkOrganizer {
     const duplicates = detectDuplicates ? await this.detectDuplicates(allBookmarks) : [];
 
     // Phase 2: Smart categorization with hierarchy
-    const suggestions = await this.generateSmartSuggestions(
-      allBookmarks,
-      maxDepth,
-      createHierarchy,
-      generateTags,
-      confidenceThreshold
-    );
+    let suggestions: OrganizationSuggestion[];
+    if (processingMode === 'batch') {
+      suggestions = await this.generateBatchSuggestions(
+        allBookmarks,
+        maxDepth,
+        createHierarchy,
+        generateTags,
+        confidenceThreshold
+      );
+    } else {
+      suggestions = await this.generateSmartSuggestions(
+        allBookmarks,
+        maxDepth,
+        createHierarchy,
+        generateTags,
+        confidenceThreshold
+      );
+    }
 
     // Phase 3: Conflict resolution
     const conflicts = this.identifyConflicts(suggestions, bookmarks);
@@ -598,6 +611,246 @@ Response Format (JSON):
     }
 
     return groups;
+  }
+
+  /**
+   * Generate batch categorization suggestions (all bookmarks at once)
+   */
+  private async generateBatchSuggestions(
+    bookmarks: Bookmark[],
+    maxDepth: number,
+    createHierarchy: boolean,
+    generateTags: boolean,
+    confidenceThreshold: number
+  ): Promise<OrganizationSuggestion[]> {
+    const model = getGenerativeModel(this.aiConfigs, this.activeConfigId);
+    const suggestions: OrganizationSuggestion[] = [];
+
+    this.addLog('info', `Starting batch categorization of ${bookmarks.length} bookmarks`);
+
+    // Check for cancellation
+    if (this.abortController?.signal.aborted) {
+      this.addLog('warning', 'Batch categorization cancelled');
+      return suggestions;
+    }
+
+    // Build comprehensive batch prompt
+    const prompt = this.buildBatchCategorizationPrompt(
+      bookmarks,
+      maxDepth,
+      createHierarchy,
+      generateTags
+    );
+
+    let attempt = 0;
+    const maxRetries = 3;
+    let success = false;
+
+    while (attempt < maxRetries && !success) {
+      try {
+        // Check for cancellation before each attempt
+        if (this.abortController?.signal.aborted) {
+          this.addLog('warning', 'Batch categorization cancelled during processing');
+          break;
+        }
+
+        this.addLog('info', `Sending batch request for ${bookmarks.length} bookmarks (attempt ${attempt + 1}/${maxRetries})`);
+
+        const response = await model.generateContent(prompt);
+        const batchSuggestions = this.parseBatchAISuggestions(response.text, bookmarks);
+
+        // Filter by confidence threshold
+        const validSuggestions = batchSuggestions.filter(s => s.confidence >= confidenceThreshold);
+
+        suggestions.push(...validSuggestions);
+
+        this.addLog('success', `Batch categorization complete. Generated ${validSuggestions.length} valid suggestions from ${bookmarks.length} bookmarks`, {
+          provider: this.activeConfigId || 'unknown'
+        });
+
+        success = true;
+
+      } catch (error: any) {
+        attempt++;
+        const errorMessage = error?.message || 'Unknown error';
+        const statusCode = error?.status || error?.code;
+
+        this.addLog('error', `Batch categorization failed: ${errorMessage}`, {
+          provider: this.activeConfigId || 'unknown',
+          statusCode,
+          retryCount: attempt
+        });
+
+        // Handle specific error codes
+        if (statusCode === 429) {
+          // Rate limit - wait longer
+          const waitTime = Math.min(60000 * Math.pow(2, attempt), 300000); // Exponential backoff, max 5 minutes
+          this.addLog('warning', `Rate limit hit for batch request. Waiting ${waitTime/1000}s before retry ${attempt}/${maxRetries}`, {
+            statusCode: 429,
+            retryCount: attempt
+          });
+
+          if (attempt < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          }
+        } else if (statusCode === 404) {
+          // Endpoint not found - don't retry
+          this.addLog('error', 'Endpoint not found for batch request. Check API configuration.', {
+            statusCode: 404
+          });
+          break;
+        } else if (statusCode === 401 || statusCode === 403) {
+          // Auth error - don't retry
+          this.addLog('error', 'Authentication error for batch request. Check API key.', {
+            statusCode
+          });
+          break;
+        } else if (attempt < maxRetries) {
+          // Other errors - retry with delay
+          const waitTime = 5000 * attempt;
+          this.addLog('warning', `Retrying batch request in ${waitTime/1000}s (attempt ${attempt}/${maxRetries})`, {
+            retryCount: attempt
+          });
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
+    }
+
+    if (!success && attempt >= maxRetries) {
+      this.addLog('error', `Batch categorization failed after ${maxRetries} attempts`, {
+        retryCount: maxRetries
+      });
+    }
+
+    return suggestions;
+  }
+
+  /**
+   * Build comprehensive batch categorization prompt
+   */
+  private buildBatchCategorizationPrompt(
+    bookmarks: Bookmark[],
+    maxDepth: number,
+    createHierarchy: boolean,
+    generateTags: boolean
+  ): string {
+    const hierarchyInstruction = createHierarchy
+      ? `Create hierarchical category structures using " > " separator (max ${maxDepth} levels).`
+      : "Suggest single category names.";
+
+    const tagInstruction = generateTags
+      ? "Also suggest 2-4 relevant tags for each bookmark."
+      : "";
+
+    // Format bookmarks for the prompt
+    const bookmarksList = bookmarks.map((bookmark, index) =>
+      `${index + 1}. Title: "${bookmark.title}" | URL: "${bookmark.url}" | Current: "${(bookmark as any).currentPath || 'Root'}"`
+    ).join('\n');
+
+    return `
+You are an expert bookmark organizer. Analyze this complete list of bookmarks and suggest optimal organization for ALL of them.
+
+BOOKMARKS TO ORGANIZE (${bookmarks.length} total):
+${bookmarksList}
+
+Task:
+For EACH bookmark, provide:
+1. ${hierarchyInstruction}
+2. Provide a confidence score (0.0-1.0) for your suggestion.
+3. Explain your reasoning briefly.
+${tagInstruction}
+
+Consider:
+- Content type (article, tool, tutorial, reference, etc.)
+- Topic domain (technology, design, business, education, etc.)
+- Use case (work, personal, research, entertainment, etc.)
+- Group similar bookmarks together logically
+- Create consistent categorization patterns
+
+Response Format (JSON Array):
+[
+  {
+    "bookmarkIndex": 1,
+    "category": "Technology > Development > Tools",
+    "confidence": 0.85,
+    "reasoning": "This is a development tool based on the URL pattern and title",
+    "tags": ["development", "tools", "productivity"]
+  },
+  {
+    "bookmarkIndex": 2,
+    "category": "Design > Resources > Tutorials",
+    "confidence": 0.92,
+    "reasoning": "Design tutorial based on content and domain",
+    "tags": ["design", "tutorial", "ui"]
+  }
+]
+
+IMPORTANT:
+- Return a valid JSON array with EXACTLY ${bookmarks.length} items
+- Use bookmarkIndex to match the numbered list above
+- Be consistent in your categorization approach
+- Group related bookmarks under similar categories
+`;
+  }
+
+  /**
+   * Parse batch AI response into structured suggestions
+   */
+  private parseBatchAISuggestions(response: string, bookmarks: Bookmark[]): OrganizationSuggestion[] {
+    try {
+      const parsed = JSON.parse(response.trim());
+
+      if (!Array.isArray(parsed)) {
+        throw new Error('Response is not an array');
+      }
+
+      return parsed.map((item: any) => {
+        const bookmarkIndex = item.bookmarkIndex - 1; // Convert to 0-based index
+        const bookmark = bookmarks[bookmarkIndex];
+
+        if (!bookmark) {
+          throw new Error(`Invalid bookmark index: ${item.bookmarkIndex}`);
+        }
+
+        return {
+          bookmarkId: bookmark.id,
+          suggestedCategory: item.category || 'Uncategorized',
+          confidence: Math.max(0, Math.min(1, item.confidence || 0)),
+          reasoning: item.reasoning || 'Batch AI-generated suggestion',
+          suggestedTags: Array.isArray(item.tags) ? item.tags : []
+        };
+      });
+
+    } catch (error) {
+      // Fallback: try to extract individual suggestions from text
+      this.addLog('warning', 'Failed to parse batch response as JSON, attempting fallback parsing', {
+        provider: this.activeConfigId || 'unknown'
+      });
+
+      const suggestions: OrganizationSuggestion[] = [];
+      const lines = response.split('\n');
+
+      for (let i = 0; i < bookmarks.length && i < lines.length; i++) {
+        const bookmark = bookmarks[i];
+        const line = lines[i];
+
+        // Simple fallback parsing
+        const categoryMatch = line.match(/category["']?\s*:\s*["']([^"']+)["']/i);
+        const confidenceMatch = line.match(/confidence["']?\s*:\s*([0-9.]+)/i);
+
+        if (categoryMatch || confidenceMatch) {
+          suggestions.push({
+            bookmarkId: bookmark.id,
+            suggestedCategory: categoryMatch ? categoryMatch[1] : 'Uncategorized',
+            confidence: confidenceMatch ? parseFloat(confidenceMatch[1]) : 0.5,
+            reasoning: 'Parsed from batch AI response',
+            suggestedTags: []
+          });
+        }
+      }
+
+      return suggestions;
+    }
   }
 
   /**

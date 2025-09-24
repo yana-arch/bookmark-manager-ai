@@ -9,6 +9,7 @@ interface AiConfigModalProps {
   onSave: (config: AiConfig) => void;
   onDelete?: (configId: string) => void;
   onSetActive?: (configId: string) => void;
+  onEdit?: (config: AiConfig) => void;
   editingConfig?: AiConfig | null;
   existingConfigs: AiConfig[];
   activeConfigId?: string | null;
@@ -22,6 +23,7 @@ const AiConfigModal: React.FC<AiConfigModalProps> = ({
   onSave,
   onDelete,
   onSetActive,
+  onEdit,
   editingConfig,
   existingConfigs,
   activeConfigId,
@@ -147,7 +149,9 @@ const AiConfigModal: React.FC<AiConfigModalProps> = ({
   };
 
   const handleEdit = (config: AiConfig) => {
-    // This will trigger the useEffect above
+    if (onEdit) {
+      onEdit(config);
+    }
   };
 
   const handleTestApi = async () => {

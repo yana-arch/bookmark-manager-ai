@@ -32,6 +32,7 @@ const AdvancedOrganizationModal: React.FC<AdvancedOrganizationModalProps> = ({
     detectDuplicates: true,
     generateTags: true,
     confidenceThreshold: 0.7,
+    processingMode: 'individual', // 'individual' | 'batch'
   });
 
   const { organizeBookmarks, applyOrganization, isLoading, error } = useAiApi();
@@ -181,7 +182,7 @@ const AdvancedOrganizationModal: React.FC<AdvancedOrganizationModalProps> = ({
             <div className="space-y-6">
               <div>
                 <h3 className="text-lg font-medium text-white mb-4">Organization Settings</h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-slate-300 mb-1">
                       Maximum Hierarchy Depth
@@ -211,6 +212,20 @@ const AdvancedOrganizationModal: React.FC<AdvancedOrganizationModalProps> = ({
                       <option value={0.7}>Medium (0.7)</option>
                       <option value={0.8}>High (0.8)</option>
                       <option value={0.9}>Very High (0.9)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-300 mb-1">
+                      Processing Mode
+                    </label>
+                    <select
+                      value={options.processingMode}
+                      onChange={(e) => setOptions(prev => ({ ...prev, processingMode: e.target.value as 'individual' | 'batch' }))}
+                      className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                      <option value="individual">Individual (1 by 1)</option>
+                      <option value="batch">Batch (All at once)</option>
                     </select>
                   </div>
                 </div>
@@ -252,12 +267,27 @@ const AdvancedOrganizationModal: React.FC<AdvancedOrganizationModalProps> = ({
                 <h4 className="text-sm font-medium text-white mb-2">What this will do:</h4>
                 <ul className="text-sm text-slate-300 space-y-1">
                   <li>• Analyze all {bookmarks.length} bookmarks using AI</li>
+                  <li>• <strong>Processing Mode:</strong> {options.processingMode === 'batch' ? 'Batch (all at once - faster)' : 'Individual (1 by 1 - more reliable)'}</li>
                   <li>• Suggest optimal categorization with confidence scores</li>
                   {options.detectDuplicates && <li>• Identify and suggest merging of duplicate bookmarks</li>}
                   {options.generateTags && <li>• Generate relevant tags for better searchability</li>}
                   {options.createHierarchy && <li>• Create hierarchical folder structure (max {options.maxDepth} levels)</li>}
                   <li>• Allow you to review and approve changes before applying</li>
                 </ul>
+                {options.processingMode === 'batch' && (
+                  <div className="mt-3 p-2 bg-blue-900/20 border border-blue-500/30 rounded">
+                    <p className="text-xs text-blue-300">
+                      💡 <strong>Batch Mode:</strong> Processes all bookmarks in one AI request. Faster but may hit token limits with many bookmarks.
+                    </p>
+                  </div>
+                )}
+                {options.processingMode === 'individual' && (
+                  <div className="mt-3 p-2 bg-green-900/20 border border-green-500/30 rounded">
+                    <p className="text-xs text-green-300">
+                      🛡️ <strong>Individual Mode:</strong> Processes one bookmark at a time. Slower but more reliable and provides detailed progress.
+                    </p>
+                  </div>
+                )}
               </div>
 
               {error && (
