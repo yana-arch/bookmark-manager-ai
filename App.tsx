@@ -1,10 +1,13 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
-import { BookmarkNode, ViewMode, Bookmark, BookmarkFolder } from './types';
+import { BookmarkNode, ViewMode, Bookmark, BookmarkFolder, AiConfig } from './types';
 import { parseBookmarksHTML, exportBookmarksToHTML } from './services/bookmarkParser';
 import BookmarkNodeComponent from './components/BookmarkNode';
 import EditBookmarkModal from './components/EditBookmarkModal';
-import { getCategorySuggestion } from './services/geminiService';
-import { AiIcon, SpinnerIcon } from './components/icons';
+import AiConfigModal from './components/modals/AiConfigModal';
+import AdvancedOrganizationModal from './components/modals/AdvancedOrganizationModal';
+import { useAiApi } from './hooks/useAiApi';
+import { useAiConfig } from './context/AiConfigContext';
+import { AiIcon, SpinnerIcon, SettingsIcon, SparklesIcon } from './components/icons';
 
 
 const Notification: React.FC<{ message: string; type: 'success' | 'error' | 'info'; onClose: () => void; }> = ({ message, type, onClose }) => {
@@ -35,14 +38,27 @@ const Notification: React.FC<{ message: string; type: 'success' | 'error' | 'inf
 
 
 const App: React.FC = () => {
-  const [bookmarks, setBookmarks] = useState<BookmarkNode[]>([]);
+  const [bookmarks, setBookmarks] = useState<BookmarkNode[]>(() => {
+    const saved = localStorage.getItem('bookmark-manager-bookmarks');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.Tree);
   const [editingNode, setEditingNode] = useState<BookmarkNode | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [isClassifying, setIsClassifying] = useState(false);
+  const [classificationController, setClassificationController] = useState<AbortController | null>(null);
   const [notification, setNotification] = useState<{message: string, type: 'success' | 'error' | 'info'} | null>(null);
+  const [showAiConfigModal, setShowAiConfigModal] = useState(false);
+  const [showAdvancedOrgModal, setShowAdvancedOrgModal] = useState(false);
+  const [editingAiConfig, setEditingAiConfig] = useState<AiConfig | null>(null);
 
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  // Use AI config context
+  const { aiConfigs, activeAiConfigId, setActiveAiConfigId, getActiveConfig, addAiConfig, updateAiConfig, deleteAiConfig } = useAiConfig();
+
+  // Use AI API hook
+  const { getCategorySuggestion } = useAiApi();
 
   const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setNotification({ message, type });
@@ -192,30 +208,111 @@ const App: React.FC = () => {
 
   const existingCategories = useMemo(() => getCategories(bookmarks), [bookmarks, getCategories]);
 
-  // Generic function to process and apply suggestions
+  // Generic function to process and apply suggestions with batching
   const runClassification = async (
     bookmarksToClassify: { bookmark: Bookmark; parentName: string | null }[]
   ) => {
+    const controller = new AbortController();
+    setClassificationController(controller);
     setIsClassifying(true);
+
     try {
-      const suggestionPromises = bookmarksToClassify.map(({ bookmark, parentName }) =>
-        getCategorySuggestion(bookmark, existingCategories).then(category => ({
-          bookmark,
-          parentName,
-          newCategory: category.trim(),
-        }))
+      // Conservative batching for rate-limited APIs
+      const BATCH_SIZE = 1; // Process 1 bookmark at a time to avoid rate limits
+      const BATCH_DELAY = 2000; // 2 second delay between requests
+      const RATE_LIMIT_DELAY = 65000; // 65 seconds for rate limit recovery
+      const results: Array<{ bookmark: Bookmark; parentName: string | null; newCategory: string }> = [];
+      let consecutiveErrors = 0;
+      const MAX_CONSECUTIVE_ERRORS = 3;
+
+      // Process in batches to avoid rate limiting
+      for (let i = 0; i < bookmarksToClassify.length; i += BATCH_SIZE) {
+        // Check if cancelled
+        if (controller.signal.aborted) {
+          showNotification("Classification cancelled by user.", 'info');
+          return;
+        }
+
+        const batch = bookmarksToClassify.slice(i, i + BATCH_SIZE);
+
+        // Process current batch
+        const batchPromises = batch.map(async ({ bookmark, parentName }) => {
+          // Check if cancelled during batch processing
+          if (controller.signal.aborted) {
+            return { bookmark, parentName, newCategory: '' };
+          }
+
+          try {
+            const category = await getCategorySuggestion(bookmark, existingCategories);
+            consecutiveErrors = 0; // Reset error counter on success
+            return {
+              bookmark,
+              parentName,
+              newCategory: category.trim(),
+            };
+          } catch (error: any) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.warn(`Failed to get category for bookmark "${bookmark.title}":`, error);
+
+            // Check if this is a rate limit error
+            if (error?.code === 'RATE_LIMIT' || errorMessage.includes('rate limit') || errorMessage.includes('429')) {
+              consecutiveErrors++;
+              showNotification(`Rate limit hit. Waiting longer before retry... (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`, 'info');
+
+              if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                throw new Error(`Rate limit exceeded ${MAX_CONSECUTIVE_ERRORS} times. Stopping classification. Try again later or use a different AI provider.`);
+              }
+
+              // Wait for rate limit recovery
+              await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY));
+              // Retry this bookmark
+              try {
+                const category = await getCategorySuggestion(bookmark, existingCategories);
+                consecutiveErrors = 0;
+                return {
+                  bookmark,
+                  parentName,
+                  newCategory: category.trim(),
+                };
+              } catch (retryError) {
+                // If retry also fails, skip this bookmark
+                return {
+                  bookmark,
+                  parentName,
+                  newCategory: '',
+                };
+              }
+            }
+
+            // For other errors, skip this bookmark and continue
+            return {
+              bookmark,
+              parentName,
+              newCategory: '',
+            };
+          }
+        });
+
+        const batchResults = await Promise.allSettled(batchPromises);
+        const successfulResults = batchResults
+          .filter(r => r.status === 'fulfilled')
+          .map(r => (r as PromiseFulfilledResult<typeof batchPromises[0] extends Promise<infer U> ? U : never>).value);
+
+        results.push(...successfulResults);
+
+        // Update progress notification
+        const processed = Math.min(i + BATCH_SIZE, bookmarksToClassify.length);
+        showNotification(`Processing bookmarks... ${processed}/${bookmarksToClassify.length} completed`, 'info');
+
+        // Add delay between batches (except for the last batch)
+        if (i + BATCH_SIZE < bookmarksToClassify.length) {
+          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+        }
+      }
+
+      const bookmarksToMove = results.filter(
+        r => r.newCategory && r.newCategory !== r.parentName
       );
-
-      const results = await Promise.allSettled(suggestionPromises);
-
-      const bookmarksToMove = results
-        .filter(
-          r =>
-            r.status === 'fulfilled' &&
-            r.value.newCategory &&
-            r.value.newCategory !== r.value.parentName
-        )
-        .map(r => (r as PromiseFulfilledResult<typeof suggestionPromises[0] extends Promise<infer U> ? U : never>).value);
 
       if (bookmarksToMove.length === 0) {
         showNotification("AI analysis complete. All bookmarks are already well-organized!", 'info');
@@ -367,6 +464,36 @@ const App: React.FC = () => {
 
   const filteredBookmarks = useMemo(() => filterNodes(bookmarks, searchTerm), [bookmarks, searchTerm]);
 
+  // Save bookmarks to localStorage whenever they change
+  useEffect(() => {
+    localStorage.setItem('bookmark-manager-bookmarks', JSON.stringify(bookmarks));
+  }, [bookmarks]);
+
+  // AI Config management functions
+  const handleSaveAiConfig = (config: Omit<AiConfig, 'id' | 'createdAt'>) => {
+    if (editingAiConfig) {
+      updateAiConfig(editingAiConfig.id, config);
+    } else {
+      addAiConfig(config);
+    }
+  };
+
+  const handleDeleteAiConfig = (configId: string) => {
+    if (window.confirm('Are you sure you want to delete this AI configuration?')) {
+      deleteAiConfig(configId);
+    }
+  };
+
+  const handleEditAiConfig = (config: AiConfig) => {
+    setEditingAiConfig(config);
+    setShowAiConfigModal(true);
+  };
+
+  const handleSetActiveAiConfig = (configId: string) => {
+    setActiveAiConfigId(configId);
+    showNotification('AI configuration updated successfully', 'success');
+  };
+
   return (
     <div className="bg-slate-900 text-slate-200 min-h-screen font-sans">
       {notification && (
@@ -381,28 +508,60 @@ const App: React.FC = () => {
           <div className="flex flex-col md:flex-row justify-between items-center">
             <h1 className="text-3xl font-bold text-white mb-4 md:mb-0">Bookmark Manager AI</h1>
             <div className="flex items-center space-x-2">
-              <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept=".html" />
-              <button onClick={handleImportClick} className="px-4 py-2 bg-blue-600 rounded-md hover:bg-blue-700 transition">Import</button>
+              <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept=".html" aria-label="Import bookmarks file" />
+              <button onClick={handleImportClick} className="px-4 py-2 bg-blue-600 rounded-md hover:bg-blue-700 transition" aria-label="Import bookmarks">Import</button>
               <button onClick={handleExportClick} className="px-4 py-2 bg-green-600 rounded-md hover:bg-green-700 transition">Export</button>
-              {process.env.API_KEY && (
-                <button 
-                  onClick={handleAiClassifyAll}
-                  disabled={isClassifying || bookmarks.length === 0}
-                  className="px-4 py-2 bg-purple-600 rounded-md hover:bg-purple-700 transition flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isClassifying ? (
-                    <>
-                      <SpinnerIcon className="w-5 h-5 mr-2 animate-spin" />
-                      Classifying...
-                    </>
-                  ) : (
-                    <>
-                      <AiIcon className="w-5 h-5 mr-2" />
-                      AI Classify All
-                    </>
+              {aiConfigs.length > 0 && (
+                <>
+                  <button
+                    onClick={handleAiClassifyAll}
+                    disabled={isClassifying || bookmarks.length === 0 || !activeAiConfigId}
+                    className="px-4 py-2 bg-purple-600 rounded-md hover:bg-purple-700 transition flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isClassifying ? (
+                      <>
+                        <SpinnerIcon className="w-5 h-5 mr-2 animate-spin" />
+                        Classifying...
+                      </>
+                    ) : (
+                      <>
+                        <AiIcon className="w-5 h-5 mr-2" />
+                        AI Classify All
+                      </>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setShowAdvancedOrgModal(true)}
+                    disabled={bookmarks.length === 0 || !activeAiConfigId}
+                    className="px-4 py-2 bg-indigo-600 rounded-md hover:bg-indigo-700 transition flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Advanced AI Organization"
+                  >
+                    <SparklesIcon className="w-5 h-5 mr-2" />
+                    Smart Organize
+                  </button>
+                  {isClassifying && classificationController && (
+                    <button
+                      onClick={() => {
+                        classificationController.abort();
+                        setClassificationController(null);
+                        setIsClassifying(false);
+                        showNotification("Classification cancelled.", 'info');
+                      }}
+                      className="px-4 py-2 bg-red-600 rounded-md hover:bg-red-700 transition flex items-center"
+                      title="Cancel classification"
+                    >
+                      Cancel
+                    </button>
                   )}
-                </button>
+                </>
               )}
+              <button
+                onClick={() => setShowAiConfigModal(true)}
+                className="px-4 py-2 bg-slate-600 rounded-md hover:bg-slate-500 transition flex items-center"
+                title="AI Configuration Settings"
+              >
+                <SettingsIcon className="w-5 h-5" />
+              </button>
             </div>
           </div>
           <div className="mt-4">
@@ -452,11 +611,34 @@ const App: React.FC = () => {
         </main>
       </div>
       {editingNode && (
-        <EditBookmarkModal 
-            node={editingNode} 
-            onClose={() => setEditingNode(null)} 
-            onSave={handleSave} 
+        <EditBookmarkModal
+            node={editingNode}
+            onClose={() => setEditingNode(null)}
+            onSave={handleSave}
             existingCategories={existingCategories}
+        />
+      )}
+      {showAiConfigModal && (
+        <AiConfigModal
+          isOpen={showAiConfigModal}
+          onClose={() => {
+            setShowAiConfigModal(false);
+            setEditingAiConfig(null);
+          }}
+          onSave={handleSaveAiConfig}
+          onDelete={handleDeleteAiConfig}
+          onSetActive={handleSetActiveAiConfig}
+          editingConfig={editingAiConfig}
+          existingConfigs={aiConfigs}
+          activeConfigId={activeAiConfigId}
+        />
+      )}
+      {showAdvancedOrgModal && (
+        <AdvancedOrganizationModal
+          isOpen={showAdvancedOrgModal}
+          onClose={() => setShowAdvancedOrgModal(false)}
+          bookmarks={bookmarks}
+          onApplyOrganization={setBookmarks}
         />
       )}
     </div>

@@ -1,50 +1,23 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
+// This file is deprecated. AI functionality has been moved to hooks/useAiApi.ts
+// The new system supports multiple AI providers and configurations.
+
+// Legacy functions for backward compatibility (if needed)
+import { useAiApi } from '../hooks/useAiApi';
 import { Bookmark } from '../types';
 
-if (!process.env.API_KEY) {
-  console.warn("API_KEY environment variable not set. AI features will be disabled.");
-}
-
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+// Note: These functions are deprecated. Use the useAiApi hook instead.
+// They are kept here for reference and potential backward compatibility.
 
 export const getCategorySuggestion = async (
   bookmark: Bookmark,
   existingCategories: string[]
 ): Promise<string> => {
-   if (!process.env.API_KEY) {
-    throw new Error("API Key is not configured. Cannot use AI features.");
-  }
-  
-  const prompt = `
-    You are an expert bookmark organizer. Your task is to suggest the best category for a new bookmark.
+  // This function is deprecated. Use useAiApi hook instead.
+  throw new Error("This function is deprecated. Use the useAiApi hook for AI functionality.");
+};
 
-    Analyze the bookmark's title and URL.
-    Bookmark Title: "${bookmark.title}"
-    Bookmark URL: "${bookmark.url}"
-
-    Here is a list of existing categories:
-    ${existingCategories.join(', ')}
-
-    Based on the bookmark's content, choose the most relevant category from the existing list. 
-    If none of the existing categories are a good fit, suggest a concise and appropriate new category name.
-
-    Your response MUST be a single category name. Do not add any explanation or punctuation.
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: {
-             thinkingConfig: { thinkingBudget: 0 }
-        }
-    });
-    
-    return response.text.trim();
-
-  } catch (error) {
-    console.error("Error getting category suggestion from Gemini API:", error);
-    throw new Error("Failed to get AI suggestion. Please try again.");
-  }
+export const getTagSuggestions = async (bookmark: Bookmark): Promise<string[]> => {
+  // This function is deprecated. Use useAiApi hook instead.
+  throw new Error("This function is deprecated. Use the useAiApi hook for AI functionality.");
 };

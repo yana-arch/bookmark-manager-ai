@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { Bookmark, BookmarkFolder, BookmarkNode } from '../types';
-import { getCategorySuggestion } from '../services/geminiService';
+import { getCategorySuggestion, getTagSuggestions } from '../services/geminiService';
 import { AiIcon, SpinnerIcon } from './icons';
 
 interface EditBookmarkModalProps {
@@ -28,11 +28,11 @@ const EditBookmarkModal: React.FC<EditBookmarkModalProps> = ({ node, onClose, on
     if (!process.env.API_KEY) return;
     setIsAutoSuggesting(true);
     try {
-        const category = await getCategorySuggestion(bookmarkNode, existingCategories);
-        if (category) {
+        const suggestedTags = await getTagSuggestions(bookmarkNode);
+        if (suggestedTags.length > 0) {
             setFormData(prev => ({
                 ...prev,
-                tags: [...(prev.tags || []), category].filter((v, i, a) => a.indexOf(v) === i)
+                tags: [...(prev.tags || []), ...suggestedTags].filter((v, i, a) => a.indexOf(v) === i)
             }));
         }
     } catch (error) {
@@ -41,7 +41,7 @@ const EditBookmarkModal: React.FC<EditBookmarkModalProps> = ({ node, onClose, on
     } finally {
         setIsAutoSuggesting(false);
     }
-  }, [existingCategories]);
+  }, []);
 
   useEffect(() => {
     if (node) {
