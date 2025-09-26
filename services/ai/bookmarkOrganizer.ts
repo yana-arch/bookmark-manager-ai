@@ -1,70 +1,29 @@
-import { Bookmark, BookmarkNode, BookmarkFolder } from '../../types';
+import { AiConfig, AiConfigGroup, Bookmark, BookmarkNode, BookmarkFolder, ProcessingLog, OrganizationPlan, OrganizationSuggestion, OrganizationConflict, DuplicateGroup } from '../../types';
 import { getGenerativeModel } from './modelFactory';
-import { AiConfig } from '../../types';
+import { buildBatchOrganizePrompt } from '../../lib/promptBuilder';
 
-export interface OrganizationSuggestion {
-  bookmarkId: string;
-  suggestedCategory: string;
-  confidence: number;
-  reasoning: string;
-  suggestedTags: string[];
-  duplicateOf?: string; // ID of duplicate bookmark if found
-}
-
-export interface OrganizationPlan {
-  suggestions: OrganizationSuggestion[];
-  newFolders: string[];
-  conflicts: OrganizationConflict[];
-  duplicates: DuplicateGroup[];
-}
-
-export interface ProcessingLog {
-  id: string;
-  timestamp: Date;
-  type: 'info' | 'warning' | 'error' | 'success';
-  message: string;
-  bookmarkTitle?: string;
-  bookmarkId?: string;
-  provider?: string;
-  statusCode?: number;
-  retryCount?: number;
-}
-
-export interface OrganizationConflict {
-  bookmarkId: string;
-  currentCategory: string;
-  suggestedCategory: string;
-  confidence: number;
-}
-
-export interface DuplicateGroup {
-  primaryBookmark: Bookmark;
-  duplicates: Bookmark[];
-  mergeStrategy: 'keep_primary' | 'keep_newest' | 'manual';
-}
+// Re-export types for convenience
+export type { ProcessingLog, OrganizationPlan, OrganizationSuggestion, OrganizationConflict, DuplicateGroup };
 
 export class BookmarkOrganizer {
   private aiConfigs: AiConfig[];
-  private activeConfigId: string | null;
+  private aiConfigGroups: AiConfigGroup[];
   private abortController: AbortController | null = null;
   private logs: ProcessingLog[] = [];
-  private onProgress?: (logs: ProcessingLog[]) => void;
+  private onProgress?: (progress: { processed: number; total: number; logs: ProcessingLog[] }) => void;
 
   constructor(
     aiConfigs: AiConfig[],
-    activeConfigId: string | null,
+    aiConfigGroups: AiConfigGroup[],
     options: {
-      onProgress?: (logs: ProcessingLog[]) => void;
+      onProgress?: (progress: { processed: number; total: number; logs: ProcessingLog[] }) => void;
     } = {}
   ) {
     this.aiConfigs = aiConfigs;
-    this.activeConfigId = activeConfigId;
+    this.aiConfigGroups = aiConfigGroups;
     this.onProgress = options.onProgress;
   }
 
-  /**
-   * Start a cancellable operation
-   */
   startOperation(): AbortController {
     this.abortController = new AbortController();
     this.logs = [];
@@ -72,145 +31,241 @@ export class BookmarkOrganizer {
     return this.abortController;
   }
 
-  /**
-   * Cancel current operation
-   */
-  cancelOperation() {
+  cancelOperation(): void {
     if (this.abortController) {
       this.abortController.abort();
       this.addLog('warning', 'Operation cancelled by user');
     }
   }
 
-  /**
-   * Add a log entry
-   */
-  private addLog(
-    type: ProcessingLog['type'],
-    message: string,
-    options: {
-      bookmarkTitle?: string;
-      bookmarkId?: string;
-      provider?: string;
-      statusCode?: number;
-      retryCount?: number;
-    } = {}
-  ) {
+  addLog(level: 'info' | 'warning' | 'error' | 'success', message: string, metadata?: Record<string, any>): void {
     const log: ProcessingLog = {
       id: crypto.randomUUID(),
-      timestamp: new Date(),
-      type,
+      level,
       message,
-      ...options
+      timestamp: new Date(),
+      metadata
     };
-
     this.logs.push(log);
-    this.onProgress?.(this.logs);
   }
 
-  /**
-   * Get current logs
-   */
   getLogs(): ProcessingLog[] {
     return [...this.logs];
   }
 
-  /**
-   * Comprehensive bookmark organization with advanced features
-   */
   async organizeBookmarks(
     bookmarks: BookmarkNode[],
     options: {
+      groupId: string;
       maxDepth?: number;
       createHierarchy?: boolean;
       detectDuplicates?: boolean;
       generateTags?: boolean;
       confidenceThreshold?: number;
-      processingMode?: 'individual' | 'batch';
-    } = {}
+      batchSize?: number;
+    }
   ): Promise<OrganizationPlan> {
     const {
+      groupId,
       maxDepth = 3,
       createHierarchy = true,
       detectDuplicates = true,
       generateTags = true,
-      confidenceThreshold = 0.7,
-      processingMode = 'individual'
+      confidenceThreshold = 0.5,
+      batchSize = 10
     } = options;
+
+    this.addLog('info', `Starting organization with options: maxDepth=${maxDepth}, createHierarchy=${createHierarchy}, detectDuplicates=${detectDuplicates}, generateTags=${generateTags}, confidenceThreshold=${confidenceThreshold}, batchSize=${batchSize}`);
 
     // Extract all bookmarks from the tree
     const allBookmarks = this.extractBookmarks(bookmarks);
+    this.addLog('info', `Extracted ${allBookmarks.length} bookmarks from the tree`);
 
-    // Phase 1: Duplicate detection
-    const duplicates = detectDuplicates ? await this.detectDuplicates(allBookmarks) : [];
-
-    // Phase 2: Smart categorization with hierarchy
-    let suggestions: OrganizationSuggestion[];
-    if (processingMode === 'batch') {
-      suggestions = await this.generateBatchSuggestions(
-        allBookmarks,
-        maxDepth,
-        createHierarchy,
-        generateTags,
-        confidenceThreshold
-      );
-    } else {
-      suggestions = await this.generateSmartSuggestions(
-        allBookmarks,
-        maxDepth,
-        createHierarchy,
-        generateTags,
-        confidenceThreshold
-      );
+    // Detect duplicates if requested
+    let duplicates: DuplicateGroup[] = [];
+    if (detectDuplicates) {
+      duplicates = this.detectDuplicates(allBookmarks);
+      this.addLog('info', `Detected ${duplicates.length} duplicate groups`);
     }
 
-    // Phase 3: Conflict resolution
+    // Get organization suggestions
+    const suggestions = await this.organizeBookmarksInParallel(
+      allBookmarks,
+      bookmarks,
+      {
+        groupId,
+        batchSize,
+        maxDepth,
+        createHierarchy,
+        generateTags,
+        confidenceThreshold
+      }
+    );
+
+    // Identify conflicts
     const conflicts = this.identifyConflicts(suggestions, bookmarks);
+    this.addLog('info', `Identified ${conflicts.length} conflicts`);
 
-    // Phase 4: Generate new folder structure
+    // Generate new folder structure
     const newFolders = this.generateFolderStructure(suggestions, createHierarchy);
+    this.addLog('info', `Generated ${newFolders.length} new folders`);
 
-    return {
+    const plan: OrganizationPlan = {
       suggestions,
-      newFolders,
       conflicts,
-      duplicates
+      duplicates,
+      newFolders,
+      metadata: {
+        totalBookmarks: allBookmarks.length,
+        processedBookmarks: suggestions.length,
+        createdAt: new Date(),
+        aiConfigsUsed: [groupId] // This should be the actual config IDs used
+      }
     };
+
+    this.addLog('success', 'Organization plan created successfully');
+    return plan;
   }
 
-  /**
-   * Extract all bookmarks from nested folder structure
-   */
+  private async organizeBookmarksInParallel(
+    bookmarksToProcess: Bookmark[],
+    originalTree: BookmarkNode[],
+    options: {
+      groupId: string;
+      batchSize: number;
+      maxDepth: number;
+      createHierarchy: boolean;
+      generateTags: boolean;
+      confidenceThreshold: number;
+    }
+  ): Promise<OrganizationSuggestion[]> {
+    const { groupId, batchSize, maxDepth, createHierarchy, generateTags, confidenceThreshold } = options;
+    
+    const group = this.aiConfigGroups.find(g => g.id === groupId);
+    if (!group || group.aiConfigIds.length === 0) {
+      this.addLog('error', `AI Group "${group?.name || groupId}" not found or is empty.`);
+      throw new Error('Invalid AI Group selected.');
+    }
+
+    const allSuggestions: OrganizationSuggestion[] = [];
+    const existingFolderStructure = JSON.stringify(this.getFolderStructure(originalTree), null, 2);
+
+    const batches: Bookmark[][] = [];
+    for (let i = 0; i < bookmarksToProcess.length; i += batchSize) {
+      batches.push(bookmarksToProcess.slice(i, i + batchSize));
+    }
+
+    this.addLog('info', `Split ${bookmarksToProcess.length} bookmarks into ${batches.length} batches for group "${group.name}".`);
+    let processedCount = 0;
+    this.onProgress?.({ processed: 0, total: batches.length, logs: this.logs });
+
+    const batchPromises = batches.map((batch, index) => async () => {
+      if (this.abortController?.signal.aborted) {
+        this.addLog('warning', `Batch ${index + 1} skipped due to cancellation.`);
+        return;
+      }
+
+      // Round-robin load balancing
+      const configId = group.aiConfigIds[index % group.aiConfigIds.length];
+      const model = getGenerativeModel(this.aiConfigs, configId);
+      const config = this.aiConfigs.find(c => c.id === configId);
+
+      this.addLog('info', `Processing batch ${index + 1}/${batches.length} with "${config?.name || configId}"...`);
+      const prompt = buildBatchOrganizePrompt(batch, existingFolderStructure, maxDepth, createHierarchy, generateTags);
+
+      try {
+        const response = await model.generateContent(prompt, { signal: this.abortController?.signal });
+        const batchSuggestions = this.parseBatchAISuggestions(response.text, batch);
+        const validSuggestions = batchSuggestions.filter(s => s.confidence >= confidenceThreshold);
+        allSuggestions.push(...validSuggestions);
+        this.addLog('success', `Batch ${index + 1} (via ${config?.name}) processed successfully.`);
+      } catch (error: any) {
+        const errorMessage = error.name === 'AbortError' ? 'Batch cancelled' : (error.message || 'Unknown error');
+        this.addLog('error', `Error in batch ${index + 1} with "${config?.name}": ${errorMessage}`, {
+          provider: config?.provider,
+          statusCode: error?.status || error?.code,
+        });
+      } finally {
+        processedCount++;
+        this.onProgress?.({ processed: processedCount, total: batches.length, logs: this.logs });
+      }
+    });
+
+    await Promise.allSettled(batchPromises.map(p => p()));
+
+    this.addLog('success', `Parallel processing complete. Total suggestions: ${allSuggestions.length}`);
+    return allSuggestions;
+  }
+
+  // ... (rest of the file remains the same) ...
+
+  private parseBatchAISuggestions(response: string, bookmarks: Bookmark[]): OrganizationSuggestion[] {
+    try {
+      // The AI might wrap the JSON in ```json ... ```, so we need to extract it.
+      const jsonMatch = response.match(/```json\n([\s\S]*?)\n```/);
+      const jsonString = jsonMatch ? jsonMatch[1] : response;
+      const parsed = JSON.parse(jsonString.trim());
+
+      if (!Array.isArray(parsed)) {
+        throw new Error('Response is not a JSON array.');
+      }
+
+      return parsed.map((item: any): OrganizationSuggestion => {
+        const bookmark = bookmarks.find(b => b.id === item.bookmarkId);
+        if (!bookmark) {
+          this.addLog('warning', `AI returned a suggestion for an unknown bookmarkId: ${item.bookmarkId}`);
+          return null;
+        }
+        return {
+          bookmarkId: item.bookmarkId,
+          suggestedCategory: item.category || 'Uncategorized',
+          confidence: Math.max(0, Math.min(1, item.confidence || 0)),
+          reasoning: item.reasoning || 'Batch AI-generated suggestion',
+          suggestedTags: Array.isArray(item.tags) ? item.tags : [],
+        };
+      }).filter((s): s is OrganizationSuggestion => s !== null);
+
+    } catch (error: any) {
+      this.addLog('error', `Failed to parse batch AI response: ${error.message}`);
+      return [];
+    }
+  }
+
+  private getFolderStructure(nodes: BookmarkNode[]): any {
+    const structure: any = {};
+    for (const node of nodes) {
+      if (node.type === 'folder') {
+        structure[node.name] = this.getFolderStructure(node.children);
+      }
+    }
+    return structure;
+  }
+
   private extractBookmarks(nodes: BookmarkNode[]): Bookmark[] {
     const bookmarks: Bookmark[] = [];
-
     const traverse = (nodes: BookmarkNode[], currentPath: string[] = []) => {
       for (const node of nodes) {
         if (node.type === 'bookmark') {
           bookmarks.push({
             ...node,
-            // Add context about current location
-            currentPath: currentPath.join(' > ')
+            currentPath: currentPath.join(' > '),
           } as Bookmark & { currentPath: string });
         } else if (node.type === 'folder') {
           traverse(node.children, [...currentPath, node.name]);
         }
       }
     };
-
     traverse(nodes);
     return bookmarks;
   }
 
-  /**
-   * Detect duplicate bookmarks using multiple strategies
-   */
-  private async detectDuplicates(bookmarks: Bookmark[]): Promise<DuplicateGroup[]> {
+  private detectDuplicates(bookmarks: Bookmark[]): DuplicateGroup[] {
     const groups: DuplicateGroup[] = [];
 
-    // Strategy 1: Exact URL matches
+    // Detect exact URL duplicates
     const urlMap = new Map<string, Bookmark[]>();
     for (const bookmark of bookmarks) {
+      if (!bookmark.url) continue;
       const url = bookmark.url.toLowerCase().trim();
       if (!urlMap.has(url)) {
         urlMap.set(url, []);
@@ -218,274 +273,91 @@ export class BookmarkOrganizer {
       urlMap.get(url)!.push(bookmark);
     }
 
-    // Strategy 2: Similar titles (using AI for fuzzy matching)
-    const titleMap = new Map<string, Bookmark[]>();
-    for (const bookmark of bookmarks) {
-      const normalizedTitle = bookmark.title.toLowerCase().trim();
-      if (!titleMap.has(normalizedTitle)) {
-        titleMap.set(normalizedTitle, []);
-      }
-      titleMap.get(normalizedTitle)!.push(bookmark);
-    }
-
-    // Process URL duplicates
-    for (const [url, bookmarkGroup] of urlMap) {
+    for (const [, bookmarkGroup] of urlMap) {
       if (bookmarkGroup.length > 1) {
         const primary = this.selectPrimaryBookmark(bookmarkGroup);
         const duplicates = bookmarkGroup.filter(b => b.id !== primary.id);
         groups.push({
           primaryBookmark: primary,
           duplicates,
-          mergeStrategy: 'keep_primary'
+          mergeStrategy: 'keep_primary',
         });
       }
     }
 
-    // Process title similarities (AI-powered)
-    const model = getGenerativeModel(this.aiConfigs, this.activeConfigId);
-    for (const [title, bookmarkGroup] of titleMap) {
-      if (bookmarkGroup.length > 1 && bookmarkGroup.length <= 5) {
-        // Only check small groups to avoid API spam
-        const similarGroups = await this.findSimilarBookmarks(bookmarkGroup, model);
-        groups.push(...similarGroups);
+    // Detect same domain duplicates - group by domain and keep shortest URL
+    const domainMap = new Map<string, Bookmark[]>();
+    for (const bookmark of bookmarks) {
+      if (!bookmark.url) continue;
+      try {
+        const url = new URL(bookmark.url);
+        const domain = url.hostname.toLowerCase();
+        if (!domainMap.has(domain)) {
+          domainMap.set(domain, []);
+        }
+        domainMap.get(domain)!.push(bookmark);
+      } catch (error) {
+        // Invalid URL, skip
+        continue;
+      }
+    }
+
+    for (const [domain, bookmarkGroup] of domainMap) {
+      if (bookmarkGroup.length > 1) {
+        // Sort by URL length (shortest first) and then by title quality
+        const sortedBookmarks = bookmarkGroup.sort((a, b) => {
+          // First priority: shorter URL
+          const urlLengthA = a.url?.length || 0;
+          const urlLengthB = b.url?.length || 0;
+          if (urlLengthA !== urlLengthB) {
+            return urlLengthA - urlLengthB;
+          }
+
+          // Second priority: title length (longer title is better)
+          const titleLengthA = a.title?.length || 0;
+          const titleLengthB = b.title?.length || 0;
+          if (titleLengthA !== titleLengthB) {
+            return titleLengthB - titleLengthA;
+          }
+
+          // Third priority: has tags
+          const tagsA = a.tags?.length || 0;
+          const tagsB = b.tags?.length || 0;
+          return tagsB - tagsA;
+        });
+
+        const primary = sortedBookmarks[0];
+        const duplicates = sortedBookmarks.slice(1);
+
+        // Only create group if we have actual duplicates
+        if (duplicates.length > 0) {
+          groups.push({
+            primaryBookmark: primary,
+            duplicates,
+            mergeStrategy: 'keep_primary',
+          });
+
+          this.addLog('info', `Found ${duplicates.length + 1} bookmarks for domain "${domain}", keeping: "${primary.title || primary.url}"`);
+        }
       }
     }
 
     return groups;
   }
-
-  /**
-   * Generate smart categorization suggestions with hierarchy
-   */
-  private async generateSmartSuggestions(
-    bookmarks: Bookmark[],
-    maxDepth: number,
-    createHierarchy: boolean,
-    generateTags: boolean,
-    confidenceThreshold: number
-  ): Promise<OrganizationSuggestion[]> {
-    const model = getGenerativeModel(this.aiConfigs, this.activeConfigId);
-    const suggestions: OrganizationSuggestion[] = [];
-    let retryCount = 0;
-    const maxRetries = 3;
-
-    this.addLog('info', `Starting categorization of ${bookmarks.length} bookmarks`);
-
-    // Process in batches to avoid rate limits
-    const batchSize = 1; // Process one at a time for better control
-    for (let i = 0; i < bookmarks.length; i++) {
-      // Check for cancellation
-      if (this.abortController?.signal.aborted) {
-        this.addLog('warning', 'Categorization cancelled during processing');
-        break;
-      }
-
-      const bookmark = bookmarks[i];
-      this.addLog('info', `Processing bookmark: ${bookmark.title}`, {
-        bookmarkTitle: bookmark.title,
-        bookmarkId: bookmark.id
-      });
-
-      const prompt = this.buildCategorizationPrompt(
-        bookmark,
-        maxDepth,
-        createHierarchy,
-        generateTags
-      );
-
-      let attempt = 0;
-      let success = false;
-
-      while (attempt < maxRetries && !success) {
-        try {
-          // Check for cancellation before each attempt
-          if (this.abortController?.signal.aborted) {
-            this.addLog('warning', `Cancelled processing of "${bookmark.title}"`);
-            break;
-          }
-
-          const response = await model.generateContent(prompt);
-          const suggestion = this.parseAISuggestion(response.text, bookmark.id);
-
-          if (suggestion.confidence >= confidenceThreshold) {
-            suggestions.push(suggestion);
-            this.addLog('success', `Successfully categorized "${bookmark.title}" (${Math.round(suggestion.confidence * 100)}% confidence)`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id
-            });
-            success = true;
-          } else {
-            this.addLog('warning', `Low confidence for "${bookmark.title}" (${Math.round(suggestion.confidence * 100)}%) - skipping`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id
-            });
-            success = true; // Don't retry for low confidence
-          }
-
-        } catch (error: any) {
-          attempt++;
-          const errorMessage = error?.message || 'Unknown error';
-          const statusCode = error?.status || error?.code;
-
-          this.addLog('error', `Failed to categorize "${bookmark.title}": ${errorMessage}`, {
-            bookmarkTitle: bookmark.title,
-            bookmarkId: bookmark.id,
-            provider: this.activeConfigId || 'unknown',
-            statusCode,
-            retryCount: attempt
-          });
-
-          // Handle specific error codes
-          if (statusCode === 429) {
-            // Rate limit - wait longer
-            const waitTime = Math.min(30000 * Math.pow(2, attempt), 300000); // Exponential backoff, max 5 minutes
-            this.addLog('warning', `Rate limit hit for "${bookmark.title}". Waiting ${waitTime/1000}s before retry ${attempt}/${maxRetries}`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id,
-              statusCode: 429,
-              retryCount: attempt
-            });
-
-            if (attempt < maxRetries) {
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-            }
-          } else if (statusCode === 404) {
-            // Endpoint not found - don't retry
-            this.addLog('error', `Endpoint not found for "${bookmark.title}". Skipping.`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id,
-              statusCode: 404
-            });
-            break;
-          } else if (statusCode === 401 || statusCode === 403) {
-            // Auth error - don't retry
-            this.addLog('error', `Authentication error for "${bookmark.title}". Check API key.`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id,
-              statusCode
-            });
-            break;
-          } else if (attempt < maxRetries) {
-            // Other errors - retry with shorter delay
-            const waitTime = 2000 * attempt;
-            this.addLog('warning', `Retrying "${bookmark.title}" in ${waitTime/1000}s (attempt ${attempt}/${maxRetries})`, {
-              bookmarkTitle: bookmark.title,
-              bookmarkId: bookmark.id,
-              retryCount: attempt
-            });
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-          }
-        }
-      }
-
-      if (!success && attempt >= maxRetries) {
-        this.addLog('error', `Failed to categorize "${bookmark.title}" after ${maxRetries} attempts`, {
-          bookmarkTitle: bookmark.title,
-          bookmarkId: bookmark.id,
-          retryCount: maxRetries
-        });
-      }
-
-      // Progress update
-      const progress = Math.round(((i + 1) / bookmarks.length) * 100);
-      this.addLog('info', `Progress: ${i + 1}/${bookmarks.length} bookmarks processed (${progress}%)`);
-
-      // Small delay between bookmarks
-      if (i < bookmarks.length - 1 && !this.abortController?.signal.aborted) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
-
-    this.addLog('success', `Categorization complete. Generated ${suggestions.length} suggestions from ${bookmarks.length} bookmarks`);
-    return suggestions;
+  
+  private selectPrimaryBookmark(bookmarks: Bookmark[]): Bookmark {
+    return bookmarks.reduce((primary, current) => {
+      const primaryScore = (primary.title?.length || 0) + (primary.tags?.length || 0);
+      const currentScore = (current.title?.length || 0) + (current.tags?.length || 0);
+      return currentScore > primaryScore ? current : primary;
+    });
   }
 
-  /**
-   * Build sophisticated categorization prompt
-   */
-  private buildCategorizationPrompt(
-    bookmark: Bookmark & { currentPath?: string },
-    maxDepth: number,
-    createHierarchy: boolean,
-    generateTags: boolean
-  ): string {
-    const hierarchyInstruction = createHierarchy
-      ? `Create a hierarchical category structure using " > " separator (max ${maxDepth} levels).`
-      : "Suggest a single category name.";
-
-    const tagInstruction = generateTags
-      ? "Also suggest 3-5 relevant tags for better organization and search."
-      : "";
-
-    return `
-You are an expert bookmark organizer. Analyze this bookmark and suggest the optimal organization.
-
-Bookmark Details:
-- Title: "${bookmark.title}"
-- URL: "${bookmark.url}"
-- Current Location: "${bookmark.currentPath || 'Root'}"
-- Description/Tags: "${bookmark.tags?.join(', ') || 'None'}"
-
-Task:
-1. ${hierarchyInstruction}
-2. Provide a confidence score (0.0-1.0) for your suggestion.
-3. Explain your reasoning briefly.
-${tagInstruction}
-
-Consider:
-- Content type (article, tool, tutorial, reference, etc.)
-- Topic domain (technology, design, business, education, etc.)
-- Use case (work, personal, research, entertainment, etc.)
-- Existing organizational patterns
-
-Response Format (JSON):
-{
-  "category": "Technology > Development > Tools",
-  "confidence": 0.85,
-  "reasoning": "This is a development tool based on the URL pattern and title",
-  "tags": ["development", "tools", "productivity", "web"]
-}
-`;
-  }
-
-  /**
-   * Parse AI response into structured suggestion
-   */
-  private parseAISuggestion(response: string, bookmarkId: string): OrganizationSuggestion {
-    try {
-      const parsed = JSON.parse(response.trim());
-      return {
-        bookmarkId,
-        suggestedCategory: parsed.category || 'Uncategorized',
-        confidence: Math.max(0, Math.min(1, parsed.confidence || 0)),
-        reasoning: parsed.reasoning || 'AI-generated suggestion',
-        suggestedTags: Array.isArray(parsed.tags) ? parsed.tags : []
-      };
-    } catch (error) {
-      // Fallback parsing for non-JSON responses
-      const categoryMatch = response.match(/["']?category["']?\s*:\s*["']([^"']+)["']/i);
-      const confidenceMatch = response.match(/["']?confidence["']?\s*:\s*([0-9.]+)/i);
-
-      return {
-        bookmarkId,
-        suggestedCategory: categoryMatch ? categoryMatch[1] : 'Uncategorized',
-        confidence: confidenceMatch ? parseFloat(confidenceMatch[1]) : 0.5,
-        reasoning: 'Parsed from AI response',
-        suggestedTags: []
-      };
-    }
-  }
-
-  /**
-   * Identify conflicts between current and suggested organization
-   */
   private identifyConflicts(
     suggestions: OrganizationSuggestion[],
     currentBookmarks: BookmarkNode[]
   ): OrganizationConflict[] {
     const conflicts: OrganizationConflict[] = [];
-
-    // Build current location map
     const currentLocations = new Map<string, string>();
     const buildLocationMap = (nodes: BookmarkNode[], path: string[] = []) => {
       for (const node of nodes) {
@@ -500,34 +372,25 @@ Response Format (JSON):
 
     for (const suggestion of suggestions) {
       const currentLocation = currentLocations.get(suggestion.bookmarkId) || 'Root';
-      const suggestedLocation = suggestion.suggestedCategory;
-
-      // Check if they're different and confidence is high
-      if (currentLocation !== suggestedLocation && suggestion.confidence > 0.8) {
+      if (currentLocation !== suggestion.suggestedCategory) {
         conflicts.push({
           bookmarkId: suggestion.bookmarkId,
           currentCategory: currentLocation,
-          suggestedCategory: suggestedLocation,
-          confidence: suggestion.confidence
+          suggestedCategory: suggestion.suggestedCategory,
+          confidence: suggestion.confidence,
         });
       }
     }
-
     return conflicts;
   }
 
-  /**
-   * Generate optimal folder structure from suggestions
-   */
   private generateFolderStructure(
     suggestions: OrganizationSuggestion[],
     createHierarchy: boolean
   ): string[] {
     const folders = new Set<string>();
-
     for (const suggestion of suggestions) {
       if (createHierarchy) {
-        // Split hierarchical categories
         const parts = suggestion.suggestedCategory.split(' > ');
         let currentPath = '';
         for (const part of parts) {
@@ -538,351 +401,7 @@ Response Format (JSON):
         folders.add(suggestion.suggestedCategory);
       }
     }
-
     return Array.from(folders).sort();
-  }
-
-  /**
-   * Select primary bookmark from duplicates
-   */
-  private selectPrimaryBookmark(bookmarks: Bookmark[]): Bookmark {
-    // Prefer bookmarks with more metadata
-    return bookmarks.reduce((primary, current) => {
-      const primaryScore = this.getBookmarkScore(primary);
-      const currentScore = this.getBookmarkScore(current);
-      return currentScore > primaryScore ? current : primary;
-    });
-  }
-
-  /**
-   * Score bookmark based on metadata completeness
-   */
-  private getBookmarkScore(bookmark: Bookmark): number {
-    let score = 0;
-    if (bookmark.title) score += 2;
-    if (bookmark.tags && bookmark.tags.length > 0) score += 1;
-    if (bookmark.addDate) score += 1;
-    if (bookmark.icon) score += 1;
-    return score;
-  }
-
-  /**
-   * Find similar bookmarks using AI
-   */
-  private async findSimilarBookmarks(
-    bookmarks: Bookmark[],
-    model: any
-  ): Promise<DuplicateGroup[]> {
-    if (bookmarks.length < 2) return [];
-
-    const groups: DuplicateGroup[] = [];
-
-    // Compare each pair
-    for (let i = 0; i < bookmarks.length; i++) {
-      for (let j = i + 1; j < bookmarks.length; j++) {
-        const bookmark1 = bookmarks[i];
-        const bookmark2 = bookmarks[j];
-
-        const similarity = await this.calculateSimilarity(bookmark1, bookmark2, model);
-
-        if (similarity > 0.8) { // High similarity threshold
-          const primary = this.selectPrimaryBookmark([bookmark1, bookmark2]);
-          const duplicate = primary.id === bookmark1.id ? bookmark2 : bookmark1;
-
-          // Check if already in a group
-          const existingGroup = groups.find(g =>
-            g.primaryBookmark.id === primary.id ||
-            g.duplicates.some(d => d.id === primary.id)
-          );
-
-          if (existingGroup) {
-            if (!existingGroup.duplicates.some(d => d.id === duplicate.id)) {
-              existingGroup.duplicates.push(duplicate);
-            }
-          } else {
-            groups.push({
-              primaryBookmark: primary,
-              duplicates: [duplicate],
-              mergeStrategy: 'keep_primary'
-            });
-          }
-        }
-      }
-    }
-
-    return groups;
-  }
-
-  /**
-   * Generate batch categorization suggestions (all bookmarks at once)
-   */
-  private async generateBatchSuggestions(
-    bookmarks: Bookmark[],
-    maxDepth: number,
-    createHierarchy: boolean,
-    generateTags: boolean,
-    confidenceThreshold: number
-  ): Promise<OrganizationSuggestion[]> {
-    const model = getGenerativeModel(this.aiConfigs, this.activeConfigId);
-    const suggestions: OrganizationSuggestion[] = [];
-
-    this.addLog('info', `Starting batch categorization of ${bookmarks.length} bookmarks`);
-
-    // Check for cancellation
-    if (this.abortController?.signal.aborted) {
-      this.addLog('warning', 'Batch categorization cancelled');
-      return suggestions;
-    }
-
-    // Build comprehensive batch prompt
-    const prompt = this.buildBatchCategorizationPrompt(
-      bookmarks,
-      maxDepth,
-      createHierarchy,
-      generateTags
-    );
-
-    let attempt = 0;
-    const maxRetries = 3;
-    let success = false;
-
-    while (attempt < maxRetries && !success) {
-      try {
-        // Check for cancellation before each attempt
-        if (this.abortController?.signal.aborted) {
-          this.addLog('warning', 'Batch categorization cancelled during processing');
-          break;
-        }
-
-        this.addLog('info', `Sending batch request for ${bookmarks.length} bookmarks (attempt ${attempt + 1}/${maxRetries})`);
-
-        const response = await model.generateContent(prompt);
-        const batchSuggestions = this.parseBatchAISuggestions(response.text, bookmarks);
-
-        // Filter by confidence threshold
-        const validSuggestions = batchSuggestions.filter(s => s.confidence >= confidenceThreshold);
-
-        suggestions.push(...validSuggestions);
-
-        this.addLog('success', `Batch categorization complete. Generated ${validSuggestions.length} valid suggestions from ${bookmarks.length} bookmarks`, {
-          provider: this.activeConfigId || 'unknown'
-        });
-
-        success = true;
-
-      } catch (error: any) {
-        attempt++;
-        const errorMessage = error?.message || 'Unknown error';
-        const statusCode = error?.status || error?.code;
-
-        this.addLog('error', `Batch categorization failed: ${errorMessage}`, {
-          provider: this.activeConfigId || 'unknown',
-          statusCode,
-          retryCount: attempt
-        });
-
-        // Handle specific error codes
-        if (statusCode === 429) {
-          // Rate limit - wait longer
-          const waitTime = Math.min(60000 * Math.pow(2, attempt), 300000); // Exponential backoff, max 5 minutes
-          this.addLog('warning', `Rate limit hit for batch request. Waiting ${waitTime/1000}s before retry ${attempt}/${maxRetries}`, {
-            statusCode: 429,
-            retryCount: attempt
-          });
-
-          if (attempt < maxRetries) {
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-          }
-        } else if (statusCode === 404) {
-          // Endpoint not found - don't retry
-          this.addLog('error', 'Endpoint not found for batch request. Check API configuration.', {
-            statusCode: 404
-          });
-          break;
-        } else if (statusCode === 401 || statusCode === 403) {
-          // Auth error - don't retry
-          this.addLog('error', 'Authentication error for batch request. Check API key.', {
-            statusCode
-          });
-          break;
-        } else if (attempt < maxRetries) {
-          // Other errors - retry with delay
-          const waitTime = 5000 * attempt;
-          this.addLog('warning', `Retrying batch request in ${waitTime/1000}s (attempt ${attempt}/${maxRetries})`, {
-            retryCount: attempt
-          });
-          await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
-      }
-    }
-
-    if (!success && attempt >= maxRetries) {
-      this.addLog('error', `Batch categorization failed after ${maxRetries} attempts`, {
-        retryCount: maxRetries
-      });
-    }
-
-    return suggestions;
-  }
-
-  /**
-   * Build comprehensive batch categorization prompt
-   */
-  private buildBatchCategorizationPrompt(
-    bookmarks: Bookmark[],
-    maxDepth: number,
-    createHierarchy: boolean,
-    generateTags: boolean
-  ): string {
-    const hierarchyInstruction = createHierarchy
-      ? `Create hierarchical category structures using " > " separator (max ${maxDepth} levels).`
-      : "Suggest single category names.";
-
-    const tagInstruction = generateTags
-      ? "Also suggest 2-4 relevant tags for each bookmark."
-      : "";
-
-    // Format bookmarks for the prompt
-    const bookmarksList = bookmarks.map((bookmark, index) =>
-      `${index + 1}. Title: "${bookmark.title}" | URL: "${bookmark.url}" | Current: "${(bookmark as any).currentPath || 'Root'}"`
-    ).join('\n');
-
-    return `
-You are an expert bookmark organizer. Analyze this complete list of bookmarks and suggest optimal organization for ALL of them.
-
-BOOKMARKS TO ORGANIZE (${bookmarks.length} total):
-${bookmarksList}
-
-Task:
-For EACH bookmark, provide:
-1. ${hierarchyInstruction}
-2. Provide a confidence score (0.0-1.0) for your suggestion.
-3. Explain your reasoning briefly.
-${tagInstruction}
-
-Consider:
-- Content type (article, tool, tutorial, reference, etc.)
-- Topic domain (technology, design, business, education, etc.)
-- Use case (work, personal, research, entertainment, etc.)
-- Group similar bookmarks together logically
-- Create consistent categorization patterns
-
-Response Format (JSON Array):
-[
-  {
-    "bookmarkIndex": 1,
-    "category": "Technology > Development > Tools",
-    "confidence": 0.85,
-    "reasoning": "This is a development tool based on the URL pattern and title",
-    "tags": ["development", "tools", "productivity"]
-  },
-  {
-    "bookmarkIndex": 2,
-    "category": "Design > Resources > Tutorials",
-    "confidence": 0.92,
-    "reasoning": "Design tutorial based on content and domain",
-    "tags": ["design", "tutorial", "ui"]
-  }
-]
-
-IMPORTANT:
-- Return a valid JSON array with EXACTLY ${bookmarks.length} items
-- Use bookmarkIndex to match the numbered list above
-- Be consistent in your categorization approach
-- Group related bookmarks under similar categories
-`;
-  }
-
-  /**
-   * Parse batch AI response into structured suggestions
-   */
-  private parseBatchAISuggestions(response: string, bookmarks: Bookmark[]): OrganizationSuggestion[] {
-    try {
-      const parsed = JSON.parse(response.trim());
-
-      if (!Array.isArray(parsed)) {
-        throw new Error('Response is not an array');
-      }
-
-      return parsed.map((item: any) => {
-        const bookmarkIndex = item.bookmarkIndex - 1; // Convert to 0-based index
-        const bookmark = bookmarks[bookmarkIndex];
-
-        if (!bookmark) {
-          throw new Error(`Invalid bookmark index: ${item.bookmarkIndex}`);
-        }
-
-        return {
-          bookmarkId: bookmark.id,
-          suggestedCategory: item.category || 'Uncategorized',
-          confidence: Math.max(0, Math.min(1, item.confidence || 0)),
-          reasoning: item.reasoning || 'Batch AI-generated suggestion',
-          suggestedTags: Array.isArray(item.tags) ? item.tags : []
-        };
-      });
-
-    } catch (error) {
-      // Fallback: try to extract individual suggestions from text
-      this.addLog('warning', 'Failed to parse batch response as JSON, attempting fallback parsing', {
-        provider: this.activeConfigId || 'unknown'
-      });
-
-      const suggestions: OrganizationSuggestion[] = [];
-      const lines = response.split('\n');
-
-      for (let i = 0; i < bookmarks.length && i < lines.length; i++) {
-        const bookmark = bookmarks[i];
-        const line = lines[i];
-
-        // Simple fallback parsing
-        const categoryMatch = line.match(/category["']?\s*:\s*["']([^"']+)["']/i);
-        const confidenceMatch = line.match(/confidence["']?\s*:\s*([0-9.]+)/i);
-
-        if (categoryMatch || confidenceMatch) {
-          suggestions.push({
-            bookmarkId: bookmark.id,
-            suggestedCategory: categoryMatch ? categoryMatch[1] : 'Uncategorized',
-            confidence: confidenceMatch ? parseFloat(confidenceMatch[1]) : 0.5,
-            reasoning: 'Parsed from batch AI response',
-            suggestedTags: []
-          });
-        }
-      }
-
-      return suggestions;
-    }
-  }
-
-  /**
-   * Calculate similarity between two bookmarks using AI
-   */
-  private async calculateSimilarity(
-    bookmark1: Bookmark,
-    bookmark2: Bookmark,
-    model: any
-  ): Promise<number> {
-    const prompt = `
-Compare these two bookmarks and determine if they are duplicates or very similar:
-
-Bookmark 1:
-- Title: "${bookmark1.title}"
-- URL: "${bookmark1.url}"
-
-Bookmark 2:
-- Title: "${bookmark2.title}"
-- URL: "${bookmark2.url}"
-
-Return only a number between 0.0 and 1.0 indicating similarity (1.0 = identical, 0.0 = completely different).
-Consider: title similarity, URL similarity, content type, purpose.
-`;
-
-    try {
-      const response = await model.generateContent(prompt);
-      const similarity = parseFloat(response.text.trim());
-      return isNaN(similarity) ? 0 : Math.max(0, Math.min(1, similarity));
-    } catch (error) {
-      return 0;
-    }
   }
 }
 

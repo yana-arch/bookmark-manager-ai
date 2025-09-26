@@ -2,6 +2,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import ErrorBoundary from './components/ErrorBoundary';
 import { AiConfigProvider } from './context/AiConfigContext';
 
 const rootElement = document.getElementById('root');
@@ -12,8 +13,10 @@ if (!rootElement) {
 const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
-    <AiConfigProvider>
-      <App />
-    </AiConfigProvider>
+    <ErrorBoundary>
+      <AiConfigProvider>
+        <App />
+      </AiConfigProvider>
+    </ErrorBoundary>
   </React.StrictMode>
 );

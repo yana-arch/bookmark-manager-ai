@@ -12,17 +12,18 @@ interface UseAiApiReturn {
   listModels: (config: AiConfig) => Promise<string[]>;
   getCategorySuggestion: (bookmark: Bookmark, existingCategories: string[]) => Promise<string>;
   getTagSuggestions: (bookmark: Bookmark) => Promise<string[]>;
-  // Advanced organization features
-  organizeBookmarks: (bookmarks: BookmarkNode[], options?: any) => Promise<OrganizationPlan>;
+  organizeBookmarks: (bookmarks: BookmarkNode[], options: any, onProgress: (progress: { processed: number; total: number; logs: ProcessingLog[] }) => void) => Promise<{ plan: OrganizationPlan; controller: AbortController }>;
   applyOrganization: (bookmarks: BookmarkNode[], plan: OrganizationPlan, options?: any) => BookmarkNode[];
   isLoading: boolean;
   error: ApiError | null;
+  organizationProgress: { processed: number; total: number } | null;
 }
 
 export const useAiApi = (): UseAiApiReturn => {
-  const { aiConfigs, activeAiConfigId } = useAiConfig();
+  const { aiConfigs, activeAiConfigId, aiConfigGroups } = useAiConfig();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
+  const [organizationProgress, setOrganizationProgress] = useState<{ processed: number; total: number } | null>(null);
 
   const generate = useCallback(async (
     prompt: string,
@@ -222,31 +223,34 @@ export const useAiApi = (): UseAiApiReturn => {
 
   const organizeBookmarks = useCallback(async (
     bookmarks: BookmarkNode[],
-    options: any = {}
-  ): Promise<{ plan: OrganizationPlan; controller: AbortController; logs: ProcessingLog[] }> => {
+    options: any = {},
+    onProgress: (progress: { processed: number; total: number; logs: ProcessingLog[] }) => void
+  ): Promise<{ plan: OrganizationPlan; controller: AbortController }> => {
     setIsLoading(true);
     setError(null);
+    setOrganizationProgress({ processed: 0, total: 1 }); // Initial state
 
     try {
-      const organizer = new BookmarkOrganizer(aiConfigs, activeAiConfigId, {
-        onProgress: (logs) => {
-          // Could emit progress updates here if needed
+      const organizer = new BookmarkOrganizer(aiConfigs, aiConfigGroups, {
+        onProgress: (progress) => {
+          setOrganizationProgress({ processed: progress.processed, total: progress.total });
+          onProgress(progress); // Forward to the component
         }
       });
 
       const controller = organizer.startOperation();
       const plan = await organizer.organizeBookmarks(bookmarks, options);
-      const logs = organizer.getLogs();
-
-      return { plan, controller, logs };
+      
+      return { plan, controller };
     } catch (err) {
       const apiError = err as ApiError;
       setError(apiError);
       throw apiError;
     } finally {
       setIsLoading(false);
+      setOrganizationProgress(null);
     }
-  }, [aiConfigs, activeAiConfigId]);
+  }, [aiConfigs, aiConfigGroups]);
 
   const applyOrganization = useCallback((
     bookmarks: BookmarkNode[],
@@ -274,5 +278,6 @@ export const useAiApi = (): UseAiApiReturn => {
     applyOrganization,
     isLoading,
     error,
+    organizationProgress,
   };
 };

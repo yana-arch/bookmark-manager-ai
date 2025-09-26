@@ -40,6 +40,13 @@ export interface AiConfig {
   createdAt?: string;
 }
 
+export interface AiConfigGroup {
+  id: string;          // uuid
+  name: string;        // Tên hiển thị cho nhóm
+  aiConfigIds: string[]; // Mảng các ID của các AiConfig trong nhóm này
+  createdAt?: string;
+}
+
 export interface GenerativeModel {
   id: string; // config id
   provider: ProviderName;
@@ -53,4 +60,46 @@ export interface ApiError {
   provider?: ProviderName;
   status?: number;
   raw?: any;
+}
+
+export interface ProcessingLog {
+  id: string;
+  level: 'info' | 'warning' | 'error' | 'success';
+  message: string;
+  timestamp: Date;
+  metadata?: Record<string, any>;
+}
+
+export interface OrganizationSuggestion {
+  bookmarkId: string;
+  suggestedCategory: string;
+  confidence: number;
+  reasoning: string;
+  suggestedTags: string[];
+}
+
+export interface OrganizationConflict {
+  bookmarkId: string;
+  currentCategory: string;
+  suggestedCategory: string;
+  confidence: number;
+}
+
+export interface DuplicateGroup {
+  primaryBookmark: Bookmark;
+  duplicates: Bookmark[];
+  mergeStrategy: 'keep_primary' | 'merge_tags' | 'keep_newest';
+}
+
+export interface OrganizationPlan {
+  suggestions: OrganizationSuggestion[];
+  conflicts: OrganizationConflict[];
+  duplicates: DuplicateGroup[];
+  newFolders: string[];
+  metadata: {
+    totalBookmarks: number;
+    processedBookmarks: number;
+    createdAt: Date;
+    aiConfigsUsed: string[];
+  };
 }
