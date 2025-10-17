@@ -1,4 +1,5 @@
 # Bookmark Manager AI
+# CLOSED - NOT RECOMMEND USE/CLONE THIS, USE THIS INSTEAD OF THIS => [HERE](https://github.com/yana-arch/ai-bookmark-architect)
 
 A modern bookmark management application with AI-powered organization features.
 
